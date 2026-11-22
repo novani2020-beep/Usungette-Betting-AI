@@ -5,7 +5,7 @@ from src.config import BotConfig
 
 
 class BetfairExchangeClient:
-    """Wrapper around betfairlightweight for market discovery and order placement."""
+    """Wrapper around betfairlightweight for market discovery, live prices, and order placement."""
 
     def __init__(self, config: BotConfig) -> None:
         self.config = config
@@ -27,37 +27,102 @@ class BetfairExchangeClient:
             self.trading.logout()
             self._logged_in = False
 
+    def _extract_best_back_price(self, runner_book: Any) -> float | None:
+        """Returns the highest available BACK price from runner order book, or None if unavailable."""
+        ex = getattr(runner_book, "ex", None)
+        available_to_back = getattr(ex, "available_to_back", None) or []
+        if not available_to_back:
+            return None
+
+        best_price = None
+        for entry in available_to_back:
+            price_val = (
+                entry.get("price")
+                if isinstance(entry, dict)
+                else getattr(entry, "price", None)
+            )
+            if price_val is not None:
+                price_float = float(price_val)
+                if best_price is None or price_float > best_price:
+                    best_price = price_float
+        return best_price
+
     def fetch_football_markets(
         self,
         market_type_codes: List[str],
         max_results: int = 20,
     ) -> List[Dict[str, Any]]:
         """
-        Fetches upcoming football markets for given Betfair marketTypeCodes,
-        e.g., ['OVER_UNDER_15', 'HALF_TIME_FULL_TIME'].
+        Fetches upcoming football markets for given Betfair marketTypeCodes and
+        enriches each runner with live best BACK decimal odds from list_market_book.
         """
         self.login()
         market_filter = filters.market_filter(
             event_type_ids=["1"],  # 1 = Soccer / Football
             market_type_codes=market_type_codes,
         )
-        books = self.trading.betting.list_market_catalogue(
+        catalogues = self.trading.betting.list_market_catalogue(
             filter=market_filter,
-            market_projection=["COMPETITION", "EVENT", "RUNNER_DESCRIPTION"],
+            market_projection=[
+                "COMPETITION",
+                "EVENT",
+                "MARKET_DESCRIPTION",
+                "RUNNER_DESCRIPTION",
+            ],
             max_results=max_results,
         )
+        if not catalogues:
+            return []
+
+        market_ids = [c.market_id for c in catalogues if c.market_id]
+        price_map: Dict[str, Dict[str, float | None]] = {
+            mid: {} for mid in market_ids
+        }
+
+        # Betfair list_market_book handles batches cleanly; chunk by 10 to stay well within limits
+        chunk_size = 10
+        price_projection = filters.price_projection(price_data=["EX_BEST_OFFERS"])
+        for start in range(0, len(market_ids), chunk_size):
+            batch_ids = market_ids[start : start + chunk_size]
+            market_books = self.trading.betting.list_market_book(
+                market_ids=batch_ids,
+                price_projection=price_projection,
+            )
+            for mbook in market_books or []:
+                mid = str(mbook.market_id)
+                for rbook in getattr(mbook, "runners", None) or []:
+                    sid = str(getattr(rbook, "selection_id", ""))
+                    if sid:
+                        price_map.setdefault(mid, {})[sid] = self._extract_best_back_price(rbook)
+
         results: List[Dict[str, Any]] = []
-        for book in books:
+        for cat in catalogues:
+            mid = str(cat.market_id)
+            desc = getattr(cat, "description", None)
+            market_type_code = (
+                getattr(desc, "market_type", None)
+                or (market_type_codes[0] if len(market_type_codes) == 1 else "")
+            )
+            runner_prices = price_map.get(mid, {})
+
+            runners_out: List[Dict[str, Any]] = []
+            for r in getattr(cat, "runners", None) or []:
+                sid = str(r.selection_id)
+                runners_out.append({
+                    "selection_id": sid,
+                    "name": r.runner_name,
+                    "odds": runner_prices.get(sid),
+                })
+
             results.append({
-                "market_id": book.market_id,
-                "market_name": book.market_name,
-                "competition": book.competition.name if book.competition else "Unknown",
-                "event": book.event.name if book.event else "Unknown",
-                "runners": [
-                    {"selection_id": str(r.selection_id), "name": r.runner_name}
-                    for r in (book.runners or [])
-                ],
+                "market_id": mid,
+                "market_name": cat.market_name,
+                "market_type_code": str(market_type_code),
+                "competition": cat.competition.name if cat.competition else "Unknown",
+                "event": cat.event.name if cat.event else "Unknown",
+                "runners": runners_out,
             })
+
         return results
 
     def place_dutch_orders(
